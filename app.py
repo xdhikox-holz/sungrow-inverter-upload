@@ -38,7 +38,7 @@ GMAIL_APP_PASSWORD = st.secrets.get("GMAIL_APP_PASSWORD", "")
 @st.cache_resource
 def get_drive_service():
     """Initialize Google Drive API service"""
-    credentials_dict = json.loads(st.secrets["gcp_service_account"])
+    credentials_dict = dict(st.secrets["gcp_service_account"])
     credentials = service_account.Credentials.from_service_account_info(
         credentials_dict,
         scopes=['https://www.googleapis.com/auth/drive']
