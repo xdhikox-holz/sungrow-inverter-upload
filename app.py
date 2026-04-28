@@ -1,6 +1,6 @@
 """
-Sungrow Inverter Inspection Upload System
-Web app untuk upload dokumentasi pengecekan inverter ke Google Drive
+Sungrow Inverter Inspection Upload System (OAuth version)
+Pakai user OAuth bukan service account, supaya bisa upload ke personal Drive.
 """
 
 import streamlit as st
@@ -9,8 +9,7 @@ from datetime import datetime
 from PIL import Image
 from PIL.ExifTags import TAGS
 import io
-import json
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import smtplib
@@ -33,17 +32,23 @@ GMAIL_USER = st.secrets.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = st.secrets.get("GMAIL_APP_PASSWORD", "")
 
 # ============================================
-# GOOGLE DRIVE SETUP
+# GOOGLE DRIVE SETUP (OAuth User Auth)
 # ============================================
 @st.cache_resource
 def get_drive_service():
-    """Initialize Google Drive API service"""
-    credentials_dict = dict(st.secrets["gcp_service_account"])
-    credentials = service_account.Credentials.from_service_account_info(
-        credentials_dict,
+    """Initialize Google Drive API service pakai OAuth user credentials"""
+    oauth_secrets = st.secrets["oauth_user"]
+    
+    creds = Credentials(
+        token=None,
+        refresh_token=oauth_secrets["refresh_token"],
+        token_uri=oauth_secrets["token_uri"],
+        client_id=oauth_secrets["client_id"],
+        client_secret=oauth_secrets["client_secret"],
         scopes=['https://www.googleapis.com/auth/drive']
     )
-    service = build('drive', 'v3', credentials=credentials)
+    
+    service = build('drive', 'v3', credentials=creds)
     return service
 
 # ============================================
@@ -70,7 +75,6 @@ def get_exif_timestamp(image_bytes, filename):
     except Exception:
         pass
     
-    # Fallback 1: parse dari nama file (IMG_20260428_091532.jpg)
     match = re.search(r'(\d{4})(\d{2})(\d{2})[_\-]?(\d{2})(\d{2})(\d{2})', filename)
     if match:
         try:
@@ -78,18 +82,15 @@ def get_exif_timestamp(image_bytes, filename):
         except Exception:
             pass
     
-    # Fallback 2: timestamp upload
     return datetime.now()
 
 def find_folder(service, name, parent_id):
-    """Cari folder by name di parent, return folder ID atau None"""
     query = f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
     results = service.files().list(q=query, fields="files(id, name)").execute()
     files = results.get('files', [])
     return files[0]['id'] if files else None
 
 def create_folder(service, name, parent_id):
-    """Buat folder baru di parent"""
     file_metadata = {
         'name': name,
         'mimeType': 'application/vnd.google-apps.folder',
@@ -99,27 +100,23 @@ def create_folder(service, name, parent_id):
     return folder.get('id')
 
 def count_files_in_folder(service, folder_id):
-    """Hitung jumlah file di folder (untuk continuing sequence number)"""
     query = f"'{folder_id}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'"
     results = service.files().list(q=query, fields="files(id)").execute()
     return len(results.get('files', []))
 
 def upload_file(service, file_bytes, filename, mime_type, folder_id):
-    """Upload file ke folder"""
     file_metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
     file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
     return file.get('id'), file.get('webViewLink')
 
 def get_or_create_log(service, sn_folder_id):
-    """Cari log.txt atau return None kalau belum ada"""
     query = f"name='log.txt' and '{sn_folder_id}' in parents and trashed=false"
     results = service.files().list(q=query, fields="files(id)").execute()
     files = results.get('files', [])
     return files[0]['id'] if files else None
 
 def update_log(service, sn_folder_id, kegiatan, count, first_time, last_time, catatan):
-    """Update atau buat log.txt"""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     first_str = first_time.strftime('%H:%M:%S') if first_time else '-'
     last_str = last_time.strftime('%H:%M:%S') if last_time else '-'
@@ -129,19 +126,16 @@ def update_log(service, sn_folder_id, kegiatan, count, first_time, last_time, ca
     log_id = get_or_create_log(service, sn_folder_id)
     
     if log_id:
-        # Append to existing log
         existing = service.files().get_media(fileId=log_id).execute().decode('utf-8')
         updated_content = existing + new_entry
         media = MediaIoBaseUpload(io.BytesIO(updated_content.encode('utf-8')), mimetype='text/plain')
         service.files().update(fileId=log_id, media_body=media).execute()
     else:
-        # Create new log
         media = MediaIoBaseUpload(io.BytesIO(new_entry.encode('utf-8')), mimetype='text/plain')
         file_metadata = {'name': 'log.txt', 'parents': [sn_folder_id]}
         service.files().create(body=file_metadata, media_body=media, fields='id').execute()
 
 def send_notification_email(sn, kegiatan, count, status, folder_url, first_time, last_time, catatan):
-    """Kirim email notifikasi ke admin"""
     if not GMAIL_USER or not GMAIL_APP_PASSWORD or not ADMIN_EMAIL:
         return False, "Email config not set"
     
@@ -183,7 +177,6 @@ Submitted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         return False, str(e)
 
 def check_sn_exists(service, sn):
-    """Cek apakah folder SN sudah ada di root"""
     return find_folder(service, sn, ROOT_FOLDER_ID) is not None
 
 # ============================================
@@ -199,7 +192,6 @@ st.title("🔧 Sungrow Inverter Inspection Upload")
 st.caption("Upload dokumentasi pengecekan inverter — auto-organize ke Google Drive")
 st.divider()
 
-# Validation: cek apakah secrets sudah di-set
 if not ROOT_FOLDER_ID:
     st.error("⚠️ ROOT_FOLDER_ID belum di-set di Streamlit secrets. Hubungi admin.")
     st.stop()
@@ -210,7 +202,6 @@ except Exception as e:
     st.error(f"⚠️ Gagal connect ke Google Drive: {e}")
     st.stop()
 
-# Form input
 sn_input = st.text_input(
     "Serial Number (11 karakter)",
     max_chars=11,
@@ -218,7 +209,6 @@ sn_input = st.text_input(
     help="Kombinasi huruf dan angka, tepat 11 karakter"
 ).strip().upper()
 
-# Real-time validation + check existing
 if sn_input:
     valid, msg = validate_sn(sn_input)
     if not valid:
@@ -253,12 +243,10 @@ catatan = st.text_area(
     height=80
 )
 
-# Submit
 st.divider()
 submit = st.button("🚀 Submit Upload", type="primary", use_container_width=True)
 
 if submit:
-    # Validation
     if not sn_input:
         st.error("❌ Serial Number wajib diisi")
         st.stop()
@@ -272,11 +260,9 @@ if submit:
         st.error("❌ Minimal upload 1 foto")
         st.stop()
     
-    # Process
     progress = st.progress(0, text="Memulai...")
     
     try:
-        # Step 1: Cari/buat folder SN
         progress.progress(10, text="Cek folder SN...")
         sn_folder_id = find_folder(service, sn_input, ROOT_FOLDER_ID)
         is_new_folder = False
@@ -288,13 +274,11 @@ if submit:
                 create_folder(service, folder_name, sn_folder_id)
             is_new_folder = True
         
-        # Step 2: Cari subfolder kegiatan (auto-create kalau ga ada)
         target_folder_name = KEGIATAN_FOLDERS[kegiatan]
         target_folder_id = find_folder(service, target_folder_name, sn_folder_id)
         if not target_folder_id:
             target_folder_id = create_folder(service, target_folder_name, sn_folder_id)
         
-        # Step 3: Read files + extract timestamp
         progress.progress(30, text="Baca metadata foto...")
         files_data = []
         for f in uploaded_files:
@@ -307,13 +291,9 @@ if submit:
                 'timestamp': timestamp
             })
         
-        # Step 4: Sortir by timestamp (paling awal -> akhir)
         files_data.sort(key=lambda x: x['timestamp'])
-        
-        # Step 5: Hitung existing files (continuing sequence)
         existing_count = count_files_in_folder(service, target_folder_id)
         
-        # Step 6: Upload + rename
         first_ts = None
         last_ts = None
         uploaded_count = 0
@@ -338,11 +318,9 @@ if submit:
             last_ts = ts
             uploaded_count += 1
         
-        # Step 7: Update log
         progress.progress(95, text="Update log...")
         update_log(service, sn_folder_id, kegiatan, uploaded_count, first_ts, last_ts, catatan)
         
-        # Step 8: Send email
         folder_url = f"https://drive.google.com/drive/folders/{sn_folder_id}"
         status = "✅ FOLDER BARU DIBUAT" if is_new_folder else "⚠️ SN SUDAH ADA - File di-append"
         
@@ -352,7 +330,6 @@ if submit:
         
         progress.progress(100, text="Selesai!")
         
-        # Success message
         st.success("✅ Upload berhasil!")
         
         col1, col2 = st.columns(2)
@@ -381,6 +358,5 @@ if submit:
         st.error(f"❌ Error: {str(e)}")
         st.exception(e)
 
-# Footer
 st.divider()
 st.caption("Sungrow Power Supply Co. Ltd. — Technical Service")
