@@ -364,8 +364,8 @@ kegiatan = st.radio(
     horizontal=False
 )
 
-# Mode upload berubah berdasarkan kegiatan
-is_archive_mode = kegiatan in ARCHIVE_KEGIATAN
+# Dynamic key: berubah tiap kali SN atau kegiatan ganti -> auto clear uploader
+uploader_key = f"uploader_{sn_input}_{kegiatan}"
 
 if is_archive_mode:
     st.info(f"📦 Mode Archive — upload file log/RAR/ZIP untuk **{kegiatan}**")
@@ -373,14 +373,16 @@ if is_archive_mode:
         f"Upload File Fault Recorder (RAR/ZIP/log/dll)",
         type=ARCHIVE_EXTENSIONS,
         accept_multiple_files=True,
-        help="Bisa multiple file. File akan di-upload as-is (tidak di-extract). Format support: RAR, ZIP, TAR, GZ, 7Z, LOG, TXT, CSV"
+        help="Bisa multiple file. File akan di-upload as-is (tidak di-extract). Format support: RAR, ZIP, TAR, GZ, 7Z, LOG, TXT, CSV",
+        key=uploader_key
     )
 else:
     uploaded_files = st.file_uploader(
         "Upload Foto Dokumentasi (bisa multiple)",
         type=IMAGE_EXTENSIONS,
         accept_multiple_files=True,
-        help="Foto akan di-sortir otomatis berdasarkan timestamp EXIF. Tip: kalau di HP, upload bertahap max 10 foto."
+        help="Foto akan di-sortir otomatis berdasarkan timestamp EXIF. Tip: kalau di HP, upload bertahap max 10 foto.",
+        key=uploader_key
     )
 
 if uploaded_files:
