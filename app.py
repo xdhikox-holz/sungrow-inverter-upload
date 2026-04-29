@@ -1,6 +1,6 @@
 """
 Sungrow Inverter Inspection Upload System
-v3: + Inverter Number metadata + dropdown SN existing
+v4: + RAR/archive support untuk Fault Recorder (multi-file, upload as-is)
 """
 
 import streamlit as st
@@ -30,6 +30,13 @@ KEGIATAN_FOLDERS = {
     'Inverter Condition': '06_Inverter_Condition'
 }
 
+# Kegiatan yang butuh archive upload (bukan foto)
+ARCHIVE_KEGIATAN = {'Fault Recorder'}
+
+# File extensions per mode
+IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp', 'heic']
+ARCHIVE_EXTENSIONS = ['rar', 'zip', 'tar', 'gz', '7z', 'log', 'txt', 'csv']
+
 METADATA_FILENAME = 'inverter_metadata.json'
 
 ROOT_FOLDER_ID = st.secrets.get("ROOT_FOLDER_ID", "")
@@ -55,17 +62,15 @@ def get_drive_service():
     return service
 
 # ============================================
-# METADATA HANDLING (Inverter Number ↔ SN)
+# METADATA HANDLING
 # ============================================
 def get_metadata_file_id(service):
-    """Cari file inverter_metadata.json di root folder, return None kalau belum ada"""
     query = f"name='{METADATA_FILENAME}' and '{ROOT_FOLDER_ID}' in parents and trashed=false"
     results = service.files().list(q=query, fields="files(id)").execute()
     files = results.get('files', [])
     return files[0]['id'] if files else None
 
 def load_metadata(service):
-    """Load metadata SN -> Inverter Number mapping. Return {} kalau belum ada."""
     file_id = get_metadata_file_id(service)
     if not file_id:
         return {}
@@ -76,7 +81,6 @@ def load_metadata(service):
         return {}
 
 def save_metadata(service, metadata):
-    """Save metadata dict ke file di Drive"""
     content = json.dumps(metadata, indent=2, sort_keys=True)
     media = MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='application/json')
     file_id = get_metadata_file_id(service)
@@ -89,7 +93,6 @@ def save_metadata(service, metadata):
 
 @st.cache_data(ttl=60)
 def get_metadata_cached(_service):
-    """Cached metadata load (refresh tiap 60 detik)"""
     return load_metadata(_service)
 
 # ============================================
@@ -110,6 +113,7 @@ def validate_inv_number(inv):
     return True, ""
 
 def get_exif_timestamp_from_uploaded(uploaded_file):
+    """Get timestamp dari EXIF (image only)"""
     try:
         pos = uploaded_file.tell()
         uploaded_file.seek(0)
@@ -155,10 +159,24 @@ def count_files_in_folder(service, folder_id):
     results = service.files().list(q=query, fields="files(id)").execute()
     return len(results.get('files', []))
 
-def upload_file_streaming(service, uploaded_file, filename, folder_id):
+def upload_file_streaming(service, uploaded_file, filename, folder_id, mime_type=None):
+    """Upload file as-is, support semua format"""
     uploaded_file.seek(0)
     file_metadata = {'name': filename, 'parents': [folder_id]}
-    mime_type = uploaded_file.type or 'image/jpeg'
+    
+    if not mime_type:
+        # Detect mime type berdasarkan extension
+        ext = filename.split('.')[-1].lower()
+        mime_map = {
+            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+            'webp': 'image/webp', 'heic': 'image/heic',
+            'rar': 'application/vnd.rar', 'zip': 'application/zip',
+            'tar': 'application/x-tar', 'gz': 'application/gzip',
+            '7z': 'application/x-7z-compressed',
+            'log': 'text/plain', 'txt': 'text/plain', 'csv': 'text/csv'
+        }
+        mime_type = mime_map.get(ext, 'application/octet-stream')
+    
     media = MediaIoBaseUpload(uploaded_file, mimetype=mime_type, resumable=True, chunksize=1024*1024)
     file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     return file.get('id')
@@ -189,7 +207,7 @@ def update_log(service, sn_folder_id, sn, inv_num, kegiatan, count, first_time, 
         file_metadata = {'name': 'log.txt', 'parents': [sn_folder_id]}
         service.files().create(body=file_metadata, media_body=media, fields='id').execute()
 
-def send_notification_email(sn, inv_num, kegiatan, count, status, folder_url, first_time, last_time, catatan):
+def send_notification_email(sn, inv_num, kegiatan, count, status, folder_url, first_time, last_time, catatan, file_type='foto'):
     if not GMAIL_USER or not GMAIL_APP_PASSWORD or not ADMIN_EMAIL:
         return False, "Email config not set"
     
@@ -205,7 +223,7 @@ DETAIL SUBMISSION:
 Serial Number    : {sn}
 Inverter Number  : {inv_label}
 Kegiatan         : {kegiatan}
-File berhasil    : {count} foto
+File berhasil    : {count} {file_type}
 Range waktu      : {first_str} s/d {last_str}
 Catatan          : {catatan or '-'}
 
@@ -257,7 +275,6 @@ except Exception as e:
     st.error(f"⚠️ Gagal connect ke Google Drive: {e}")
     st.stop()
 
-# Load metadata (cached)
 metadata = get_metadata_cached(service)
 
 # ============================================
@@ -268,7 +285,6 @@ mode = st.radio(
     options=["📋 Pilih dari history", "➕ Daftar SN baru"],
     horizontal=True,
     index=0 if metadata else 1,
-    help="Pilih history kalau SN udah pernah di-submit. Daftar baru kalau SN belum pernah."
 )
 
 st.divider()
@@ -277,17 +293,13 @@ sn_input = ""
 inv_number = ""
 is_new_sn = False
 
-# ============================================
-# MODE: HISTORY (Dropdown searchable)
-# ============================================
+# Mode History
 if mode == "📋 Pilih dari history":
     if not metadata:
-        st.info("📭 Belum ada SN yang ter-register. Pakai mode **Daftar SN baru** untuk SN pertama.")
+        st.info("📭 Belum ada SN ter-register. Pakai mode **Daftar SN baru** dulu.")
         st.stop()
     
-    # Build options list: "SN — INV"
     options = sorted([f"{sn} — {inv}" for sn, inv in metadata.items()])
-    
     selected = st.selectbox(
         f"🔍 Cari Inverter ({len(options)} ter-register)",
         options=["-- Pilih SN --"] + options,
@@ -302,38 +314,31 @@ if mode == "📋 Pilih dari history":
         st.info("👆 Pilih SN dari dropdown di atas untuk lanjut")
         st.stop()
 
-# ============================================
-# MODE: NEW SN (Manual input)
-# ============================================
+# Mode New
 else:
     sn_input = st.text_input(
         "Serial Number (11 karakter)",
         max_chars=11,
-        placeholder="Contoh: A2304567890",
-        help="Kombinasi huruf dan angka, tepat 11 karakter"
+        placeholder="Contoh: A2304567890"
     ).strip().upper()
     
     inv_number = st.text_input(
         "Inverter Number (max 20 karakter)",
         max_chars=20,
-        placeholder="Contoh: INV-001",
-        help="Format bebas, sesuai kebutuhan submit"
+        placeholder="Contoh: INV-001"
     ).strip()
     
-    # Validation real-time
     if sn_input:
         valid_sn, msg_sn = validate_sn(sn_input)
         if not valid_sn:
             st.warning(f"⚠️ {msg_sn}")
         else:
-            # Cek apakah SN udah ada di metadata
             if sn_input in metadata:
                 existing_inv = metadata[sn_input]
-                st.warning(f"⚠️ **SN `{sn_input}` sudah terdaftar** sebagai `{existing_inv}`. Pakai mode **Pilih dari history** atau lanjut untuk append (Inverter Number akan tetap `{existing_inv}`).")
-                inv_number = existing_inv  # force pakai yang udah ada
+                st.warning(f"⚠️ **SN `{sn_input}` sudah terdaftar** sebagai `{existing_inv}`. Inverter Number akan tetap `{existing_inv}`.")
+                inv_number = existing_inv
                 is_new_sn = False
             else:
-                # Cek folder Drive (case where folder ada tapi metadata kosong - data lama)
                 with st.spinner("Cek SN di Drive..."):
                     sn_exists = check_sn_exists(service, sn_input)
                 if sn_exists:
@@ -343,19 +348,15 @@ else:
                     st.success(f"✅ SN `{sn_input}` baru — folder akan dibuat otomatis.")
                     is_new_sn = True
             
-            # Cek inv duplikat
-            if inv_number and not is_new_sn:
-                pass  # udah handled di atas
-            elif inv_number:
-                # Cek apakah inv_number udah dipakai SN lain
+            if inv_number and is_new_sn:
                 duplicate_sn = [sn for sn, inv in metadata.items() if inv == inv_number and sn != sn_input]
                 if duplicate_sn:
-                    st.warning(f"⚠️ Inverter Number `{inv_number}` sudah dipakai SN lain: `{duplicate_sn[0]}`. Boleh lanjut, tapi pastikan ini benar.")
+                    st.warning(f"⚠️ Inverter Number `{inv_number}` sudah dipakai SN lain: `{duplicate_sn[0]}`.")
 
 st.divider()
 
 # ============================================
-# REST OF FORM (kegiatan, upload, catatan)
+# KEGIATAN SELECTOR
 # ============================================
 kegiatan = st.radio(
     "Pilih Jenis Kegiatan",
@@ -363,22 +364,43 @@ kegiatan = st.radio(
     horizontal=False
 )
 
-uploaded_files = st.file_uploader(
-    "Upload Foto Dokumentasi (bisa multiple)",
-    type=['jpg', 'jpeg', 'png', 'webp', 'heic'],
-    accept_multiple_files=True,
-    help="Foto akan di-sortir otomatis berdasarkan timestamp EXIF. Tip: kalau di HP, upload bertahap max 10 foto."
-)
+# Mode upload berubah berdasarkan kegiatan
+is_archive_mode = kegiatan in ARCHIVE_KEGIATAN
+
+if is_archive_mode:
+    st.info(f"📦 Mode Archive — upload file log/RAR/ZIP untuk **{kegiatan}**")
+    uploaded_files = st.file_uploader(
+        f"Upload File Fault Recorder (RAR/ZIP/log/dll)",
+        type=ARCHIVE_EXTENSIONS,
+        accept_multiple_files=True,
+        help="Bisa multiple file. File akan di-upload as-is (tidak di-extract). Format support: RAR, ZIP, TAR, GZ, 7Z, LOG, TXT, CSV"
+    )
+else:
+    uploaded_files = st.file_uploader(
+        "Upload Foto Dokumentasi (bisa multiple)",
+        type=IMAGE_EXTENSIONS,
+        accept_multiple_files=True,
+        help="Foto akan di-sortir otomatis berdasarkan timestamp EXIF. Tip: kalau di HP, upload bertahap max 10 foto."
+    )
 
 if uploaded_files:
     total_size_mb = sum(f.size for f in uploaded_files) / (1024 * 1024)
-    st.info(f"📸 {len(uploaded_files)} file dipilih ({total_size_mb:.1f} MB)")
+    file_label = "file" if is_archive_mode else "foto"
+    st.info(f"📸 {len(uploaded_files)} {file_label} dipilih ({total_size_mb:.1f} MB)")
+    
+    if is_archive_mode:
+        # Show list of files (archive ga di-sortir EXIF)
+        with st.expander("📋 List file"):
+            for f in uploaded_files:
+                size_mb = f.size / (1024 * 1024)
+                st.write(f"- `{f.name}` ({size_mb:.1f} MB)")
+    
     if total_size_mb > 100:
-        st.warning(f"⚠️ Ukuran total {total_size_mb:.0f} MB cukup besar. Kalau gagal, coba upload bertahap.")
+        st.warning(f"⚠️ Ukuran total {total_size_mb:.0f} MB cukup besar.")
 
 catatan = st.text_area(
     "Catatan Tambahan (opsional)",
-    placeholder="Misal: nama site, kondisi inverter, dll",
+    placeholder="Misal: nama site, kondisi inverter, tanggal kejadian fault, dll",
     height=80
 )
 
@@ -386,7 +408,6 @@ st.divider()
 submit = st.button("🚀 Submit Upload", type="primary", use_container_width=True)
 
 if submit:
-    # Validation
     if not sn_input:
         st.error("❌ Serial Number wajib diisi")
         st.stop()
@@ -402,7 +423,7 @@ if submit:
         st.stop()
     
     if not uploaded_files:
-        st.error("❌ Minimal upload 1 foto")
+        st.error("❌ Minimal upload 1 file")
         st.stop()
     
     progress = st.progress(0, text="Memulai...")
@@ -425,78 +446,113 @@ if submit:
         if not target_folder_id:
             target_folder_id = create_folder(service, target_folder_name, sn_folder_id)
         
-        # Step 2: Update metadata (link SN ↔ Inverter Number)
+        # Step 2: Update metadata
         progress.progress(15, text="Update metadata...")
         try:
             current_metadata = load_metadata(service)
             current_metadata[sn_input] = inv_number
             save_metadata(service, current_metadata)
-            # Clear cache supaya next reload dapet data fresh
             get_metadata_cached.clear()
         except Exception as meta_err:
             st.warning(f"⚠️ Metadata update gagal: {meta_err} (upload tetap lanjut)")
         
-        # Step 3: Read timestamps
-        progress.progress(20, text="Baca timestamp foto...")
-        file_meta = []
-        for f in uploaded_files:
-            ts = get_exif_timestamp_from_uploaded(f)
-            file_meta.append({'file': f, 'timestamp': ts, 'original_name': f.name})
-        
-        file_meta.sort(key=lambda x: x['timestamp'])
-        existing_count = count_files_in_folder(service, target_folder_id)
-        
-        # Step 4: Stream upload
+        # Step 3: Process files (beda antara archive vs image)
         first_ts = None
         last_ts = None
         uploaded_count = 0
         failed_files = []
+        existing_count = count_files_in_folder(service, target_folder_id)
         
-        for idx, meta in enumerate(file_meta):
-            try:
-                f = meta['file']
-                ts = meta['timestamp']
-                seq = str(existing_count + idx + 1).zfill(3)
-                date_str = ts.strftime('%Y-%m-%d')
-                time_str = ts.strftime('%H-%M-%S')
-                ext = meta['original_name'].split('.')[-1].lower()
-                new_name = f"{seq}_{date_str}_{time_str}.{ext}"
-                
-                pct = 25 + int((idx + 1) / len(file_meta) * 65)
-                progress.progress(pct, text=f"Upload {idx + 1}/{len(file_meta)}: {new_name}")
-                
-                upload_file_streaming(service, f, new_name, target_folder_id)
-                
-                if first_ts is None:
-                    first_ts = ts
-                last_ts = ts
-                uploaded_count += 1
-                gc.collect()
-                
-            except Exception as file_err:
-                failed_files.append((meta['original_name'], str(file_err)))
-                continue
+        if is_archive_mode:
+            # ========== ARCHIVE MODE: upload as-is, pakai upload time ==========
+            progress.progress(25, text="Upload archive files...")
+            
+            # Sort by upload order (sesuai user pilih)
+            for idx, f in enumerate(uploaded_files):
+                try:
+                    upload_time = datetime.now()
+                    seq = str(existing_count + idx + 1).zfill(3)
+                    date_str = upload_time.strftime('%Y-%m-%d')
+                    time_str = upload_time.strftime('%H-%M-%S')
+                    
+                    # Preserve original extension dan nama
+                    original_name = f.name
+                    ext = original_name.split('.')[-1].lower()
+                    # Format: 001_2026-04-29_14-30-15_originalname.rar
+                    base_name = '.'.join(original_name.split('.')[:-1])[:40]  # max 40 char base name
+                    new_name = f"{seq}_{date_str}_{time_str}_{base_name}.{ext}"
+                    
+                    pct = 25 + int((idx + 1) / len(uploaded_files) * 65)
+                    progress.progress(pct, text=f"Upload {idx + 1}/{len(uploaded_files)}: {new_name[:50]}...")
+                    
+                    upload_file_streaming(service, f, new_name, target_folder_id)
+                    
+                    if first_ts is None:
+                        first_ts = upload_time
+                    last_ts = upload_time
+                    uploaded_count += 1
+                    gc.collect()
+                    
+                except Exception as file_err:
+                    failed_files.append((f.name, str(file_err)))
+                    continue
         
-        # Step 5: Update log
+        else:
+            # ========== IMAGE MODE: EXIF sortir + rename ==========
+            progress.progress(20, text="Baca timestamp foto...")
+            file_meta = []
+            for f in uploaded_files:
+                ts = get_exif_timestamp_from_uploaded(f)
+                file_meta.append({'file': f, 'timestamp': ts, 'original_name': f.name})
+            
+            file_meta.sort(key=lambda x: x['timestamp'])
+            
+            for idx, meta in enumerate(file_meta):
+                try:
+                    f = meta['file']
+                    ts = meta['timestamp']
+                    seq = str(existing_count + idx + 1).zfill(3)
+                    date_str = ts.strftime('%Y-%m-%d')
+                    time_str = ts.strftime('%H-%M-%S')
+                    ext = meta['original_name'].split('.')[-1].lower()
+                    new_name = f"{seq}_{date_str}_{time_str}.{ext}"
+                    
+                    pct = 25 + int((idx + 1) / len(file_meta) * 65)
+                    progress.progress(pct, text=f"Upload {idx + 1}/{len(file_meta)}: {new_name}")
+                    
+                    upload_file_streaming(service, f, new_name, target_folder_id)
+                    
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
+                    uploaded_count += 1
+                    gc.collect()
+                    
+                except Exception as file_err:
+                    failed_files.append((meta['original_name'], str(file_err)))
+                    continue
+        
+        # Step 4: Log
         progress.progress(95, text="Update log...")
         if uploaded_count > 0:
             update_log(service, sn_folder_id, sn_input, inv_number, kegiatan, uploaded_count, first_ts, last_ts, catatan)
         
-        # Step 6: Email
+        # Step 5: Email
         folder_url = f"https://drive.google.com/drive/folders/{sn_folder_id}"
         status = "✅ FOLDER BARU DIBUAT" if is_new_folder else "⚠️ SN SUDAH ADA - File di-append"
+        file_type = "file archive" if is_archive_mode else "foto"
         
         email_sent, email_msg = send_notification_email(
-            sn_input, inv_number, kegiatan, uploaded_count, status, folder_url, first_ts, last_ts, catatan
+            sn_input, inv_number, kegiatan, uploaded_count, status, folder_url, first_ts, last_ts, catatan, file_type
         )
         
         progress.progress(100, text="Selesai!")
         
         # Result UI
         if uploaded_count > 0 and not failed_files:
-            st.success(f"✅ Upload berhasil! {uploaded_count} file ke-upload.")
+            st.success(f"✅ Upload berhasil! {uploaded_count} {file_type} ke-upload.")
         elif uploaded_count > 0 and failed_files:
-            st.warning(f"⚠️ {uploaded_count} file sukses, {len(failed_files)} file gagal.")
+            st.warning(f"⚠️ {uploaded_count} sukses, {len(failed_files)} gagal.")
             with st.expander("📋 File yang gagal"):
                 for name, err in failed_files:
                     st.write(f"- **{name}**: {err}")
@@ -523,8 +579,10 @@ if submit:
                 st.write(f"**Serial Number:** `{sn_input}`")
                 st.write(f"**Inverter Number:** `{inv_number}`")
                 st.write(f"**Kegiatan:** {kegiatan}")
+                st.write(f"**Mode:** {'Archive' if is_archive_mode else 'Image'}")
                 st.write(f"**Jumlah file:** {uploaded_count}")
-                st.write(f"**Range waktu:** {first_ts.strftime('%Y-%m-%d %H:%M:%S')} → {last_ts.strftime('%H:%M:%S')}")
+                if first_ts and last_ts:
+                    st.write(f"**Range waktu:** {first_ts.strftime('%Y-%m-%d %H:%M:%S')} → {last_ts.strftime('%H:%M:%S')}")
                 if catatan:
                     st.write(f"**Catatan:** {catatan}")
         
