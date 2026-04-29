@@ -1,6 +1,6 @@
 """
 Sungrow Inverter Inspection Upload System
-v4: + RAR/archive support untuk Fault Recorder (multi-file, upload as-is)
+v5: + auto-clear uploader saat ganti SN/kegiatan
 """
 
 import streamlit as st
@@ -113,7 +113,6 @@ def validate_inv_number(inv):
     return True, ""
 
 def get_exif_timestamp_from_uploaded(uploaded_file):
-    """Get timestamp dari EXIF (image only)"""
     try:
         pos = uploaded_file.tell()
         uploaded_file.seek(0)
@@ -160,12 +159,10 @@ def count_files_in_folder(service, folder_id):
     return len(results.get('files', []))
 
 def upload_file_streaming(service, uploaded_file, filename, folder_id, mime_type=None):
-    """Upload file as-is, support semua format"""
     uploaded_file.seek(0)
     file_metadata = {'name': filename, 'parents': [folder_id]}
     
     if not mime_type:
-        # Detect mime type berdasarkan extension
         ext = filename.split('.')[-1].lower()
         mime_map = {
             'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
@@ -364,6 +361,9 @@ kegiatan = st.radio(
     horizontal=False
 )
 
+# Mode upload berubah berdasarkan kegiatan
+is_archive_mode = kegiatan in ARCHIVE_KEGIATAN
+
 # Dynamic key: berubah tiap kali SN atau kegiatan ganti -> auto clear uploader
 uploader_key = f"uploader_{sn_input}_{kegiatan}"
 
@@ -391,7 +391,6 @@ if uploaded_files:
     st.info(f"📸 {len(uploaded_files)} {file_label} dipilih ({total_size_mb:.1f} MB)")
     
     if is_archive_mode:
-        # Show list of files (archive ga di-sortir EXIF)
         with st.expander("📋 List file"):
             for f in uploaded_files:
                 size_mb = f.size / (1024 * 1024)
@@ -431,7 +430,6 @@ if submit:
     progress = st.progress(0, text="Memulai...")
     
     try:
-        # Step 1: Folder setup
         progress.progress(5, text="Cek folder SN...")
         sn_folder_id = find_folder(service, sn_input, ROOT_FOLDER_ID)
         is_new_folder = False
@@ -448,7 +446,6 @@ if submit:
         if not target_folder_id:
             target_folder_id = create_folder(service, target_folder_name, sn_folder_id)
         
-        # Step 2: Update metadata
         progress.progress(15, text="Update metadata...")
         try:
             current_metadata = load_metadata(service)
@@ -458,7 +455,6 @@ if submit:
         except Exception as meta_err:
             st.warning(f"⚠️ Metadata update gagal: {meta_err} (upload tetap lanjut)")
         
-        # Step 3: Process files (beda antara archive vs image)
         first_ts = None
         last_ts = None
         uploaded_count = 0
@@ -466,10 +462,8 @@ if submit:
         existing_count = count_files_in_folder(service, target_folder_id)
         
         if is_archive_mode:
-            # ========== ARCHIVE MODE: upload as-is, pakai upload time ==========
             progress.progress(25, text="Upload archive files...")
             
-            # Sort by upload order (sesuai user pilih)
             for idx, f in enumerate(uploaded_files):
                 try:
                     upload_time = datetime.now()
@@ -477,11 +471,9 @@ if submit:
                     date_str = upload_time.strftime('%Y-%m-%d')
                     time_str = upload_time.strftime('%H-%M-%S')
                     
-                    # Preserve original extension dan nama
                     original_name = f.name
                     ext = original_name.split('.')[-1].lower()
-                    # Format: 001_2026-04-29_14-30-15_originalname.rar
-                    base_name = '.'.join(original_name.split('.')[:-1])[:40]  # max 40 char base name
+                    base_name = '.'.join(original_name.split('.')[:-1])[:40]
                     new_name = f"{seq}_{date_str}_{time_str}_{base_name}.{ext}"
                     
                     pct = 25 + int((idx + 1) / len(uploaded_files) * 65)
@@ -500,7 +492,6 @@ if submit:
                     continue
         
         else:
-            # ========== IMAGE MODE: EXIF sortir + rename ==========
             progress.progress(20, text="Baca timestamp foto...")
             file_meta = []
             for f in uploaded_files:
@@ -534,12 +525,10 @@ if submit:
                     failed_files.append((meta['original_name'], str(file_err)))
                     continue
         
-        # Step 4: Log
         progress.progress(95, text="Update log...")
         if uploaded_count > 0:
             update_log(service, sn_folder_id, sn_input, inv_number, kegiatan, uploaded_count, first_ts, last_ts, catatan)
         
-        # Step 5: Email
         folder_url = f"https://drive.google.com/drive/folders/{sn_folder_id}"
         status = "✅ FOLDER BARU DIBUAT" if is_new_folder else "⚠️ SN SUDAH ADA - File di-append"
         file_type = "file archive" if is_archive_mode else "foto"
@@ -550,7 +539,6 @@ if submit:
         
         progress.progress(100, text="Selesai!")
         
-        # Result UI
         if uploaded_count > 0 and not failed_files:
             st.success(f"✅ Upload berhasil! {uploaded_count} {file_type} ke-upload.")
         elif uploaded_count > 0 and failed_files:
