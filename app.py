@@ -24,7 +24,9 @@ KEGIATAN_FOLDERS = {
     'Update Firmware': '01_Update_Firmware',
     'DC SPD': '02_DC_SPD',
     'Thermal Imaging': '03_Thermal_Imaging',
-    'Fault Recorder': '04_Fault_Recorder'
+    'Fault Recorder': '04_Fault_Recorder',
+    'DC Insulation Test': '05_DC_Insulation_Test',
+    'Inverter Condition': '06_Inverter_Condition'
 }
 
 ROOT_FOLDER_ID = st.secrets.get("ROOT_FOLDER_ID", "")
